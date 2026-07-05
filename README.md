@@ -1,5 +1,7 @@
 # overSeer
 
+![overSeer banner](img/overseer.png)
+
 > 一个有预算意识的开发监理 agent。常驻 daemon + CLI + TUI；用 GLM-5.2 等 Coding API 执行 (计划-设计-开发-测试-评估) 循环；自主维护一个 Obsidian 知识库；监控自己的 token 消耗，逼近上限就休息。
 
 ## 快速开始
