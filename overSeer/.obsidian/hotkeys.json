@@ -1,0 +1,17 @@
+{
+  "command-palette:open": [
+    { "modifiers": ["Mod"], "key": "p" }
+  ],
+  "graph:open": [
+    { "modifiers": ["Mod", "Shift"], "key": "G" }
+  ],
+  "global-search:open": [
+    { "modifiers": ["Mod", "Shift"], "key": "F" }
+  ],
+  "daily-notes": [
+    { "modifiers": ["Mod", "Alt"], "key": "D" }
+  ],
+  "templates:insert-template": [
+    { "modifiers": ["Mod", "Alt"], "key": "T" }
+  ]
+}

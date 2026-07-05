@@ -1,0 +1,189 @@
+# ============================================================================
+# overSeer 主配置文件
+# ============================================================================
+# 这是主配置，可以放心提交到 git（不含密钥）。
+# API Key 请填到 config/.secrets.yaml（已在 .gitignore 中忽略），或环境变量。
+# 本文件路径优先级：overseer.config.yaml < overseer.config.local.yaml < env
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 工作区与路径
+# ----------------------------------------------------------------------------
+workspace:
+  # 监理根目录（默认为 overSeer 父目录，即整个 codeSpace）
+  root: ..
+  # 哪些子目录算作被监理的项目（相对 workspace.root）。空数组 = 自动扫描
+  watchProjects: []
+  # 哪些目录前缀忽略（不扫描、不改）
+  ignore:
+    - node_modules
+    - dist
+    - .git
+    - vault
+    - data
+    - logs
+
+# ----------------------------------------------------------------------------
+# Vault (Obsidian 知识库)
+# ----------------------------------------------------------------------------
+vault:
+  root: vault
+  # 是否写入 .obsidian 配置让用户能直接用 Obsidian 打开
+  manageObsidianConfig: true
+  dailyDir: overSeer/daily
+  decisionsDir: overSeer/decisions
+  budgetsDir: overSeer/budgets
+
+# ----------------------------------------------------------------------------
+# Providers —— 填 key 优先级：env OVERSEER_<ID>_API_KEY > .secrets.yaml > 此处
+# ----------------------------------------------------------------------------
+providers:
+  glm:
+    enabled: true
+    kind: glm              # 对应 src/providers/glm.ts
+    # 智谱开放平台 / Coding Plan 主入口
+    baseUrl: https://open.bigmodel.cn/api/paas/v4
+    apiKey: ""             # ← 在这里填，或写到 config/.secrets.yaml，或设环境变量 OVERSEER_GLM_API_KEY
+    # Coding Plan 用户默认模型：glm-5.2（最新一代，长上下文，适合编码循环）
+    model: glm-5.2
+    # 备用模型（按主模型超限/失败时降级）
+    fallbackModels:
+      - glm-4.6
+      - glm-4.5-air
+    # 单请求超时（毫秒）
+    timeout: 120000
+    # 每分钟最大请求数（Coding Plan 默认额度，按你套餐调整）
+    rpmLimit: 60
+
+  # 未来扩展（M4 阶段启用）
+  anthropic:
+    enabled: false
+    kind: anthropic
+    baseUrl: https://api.anthropic.com
+    apiKey: ""
+    model: claude-sonnet-4-5
+  openai:
+    enabled: false
+    kind: openai
+    baseUrl: https://api.openai.com/v1
+    apiKey: ""
+    model: gpt-4o
+
+  # ----------------------------------------------------------------------------
+  # 本地小模型 fallback —— 主控预算逼近上限时接管（仅调度/事件响应/回复）
+  # 已启用：gemma4:latest（8.95GB / 8B params，Google Gemma 4，文本+图像）
+  # ----------------------------------------------------------------------------
+  local:
+    enabled: true
+    kind: local
+    role: fallback              # 关键：标记为 fallback，canAct 强制 false
+    # Ollama 默认 OpenAI 兼容端点；LM Studio 用 http://localhost:1234/v1
+    baseUrl: http://localhost:11434/v1
+    # 任意非空字符串即可（Ollama 不校验）
+    apiKey: "ollama"
+    # 已拉：gemma4:latest（8B params，128K context，多模态）
+    # 备选可换：gemma3:12b / qwen2.5-coder:7b / qwen3:8b
+    model: gemma4:latest
+    fallbackModels:
+      - gemma3:12b
+      - qwen2.5-coder:7b
+    timeout: 180000
+    rpmLimit: 120
+
+# ----------------------------------------------------------------------------
+# Provider 路由策略
+# ----------------------------------------------------------------------------
+router:
+  # 主链（按顺序 failover）—— 只放 main 角色
+  chain: [glm]
+  # 降级模式启用的 fallback provider id（必须 role: fallback）
+  # 主链预算耗尽时，daemon 切到此 provider 处理 chat/调度，禁所有写/删/执行
+  fallback: local
+  # 任务类型 → 偏好（M2/M4 阶段细化）
+  taskRouting:
+    chat: glm
+    planning: glm
+    embedding: glm
+    summary: glm
+
+# ----------------------------------------------------------------------------
+# Token 预算 —— core 功能：自我保护
+# ----------------------------------------------------------------------------
+budget:
+  # 配置上限（你的 Coding Plan 套餐额度；以下为占位，请按实际套餐改）
+  dailyLimitTokens: 5000000      # 每日 token 上限
+  weeklyLimitTokens: 35000000    # 每周 token 上限
+  # 安全垫：剩余预算低于此值时，daemon 进入"轻巡检"模式，拒绝大任务
+  safetyPadTokens: 200000
+  # 单任务估算上限：超过此值即使预算够，也要拆分或人工确认
+  perTaskEstimateCap: 800000
+  # 是否尝试调用 provider 的配额 API（如果 provider 支持）
+  useQuotaApi: true
+  # 配额 API 不可用时，回退到本地累计的滚动窗口估算
+  rollingWindowHours: 24
+  # 当逼近上限时执行的动作
+  onLowBudget:
+    - log
+    - pause
+    - notify_cli
+
+# ----------------------------------------------------------------------------
+# Daemon 行为
+# ----------------------------------------------------------------------------
+daemon:
+  # 巡检间隔（毫秒）。默认 10 分钟一轮（自主巡检：扫描项目 + 入队意向）
+  supervisionIntervalMs: 600000
+  # IPC 管道名（Windows: \\.\pipe\<name>，Unix: /tmp/<name>.sock）
+  ipcName: overseer
+  # PID 文件
+  pidFile: data/daemon.pid
+  # 单轮意向队列最多执行几个目标
+  maxIntentionsPerCycle: 3
+
+  # ---- M4 自主巡检 ----
+  autonomy:
+    # 激进度：light=只跑 git/todo 扫描；normal=+outdated；full=+test
+    # 注意：degraded/stopped 模式下，需要 spawn 子进程的扫描器（outdated/test）
+    #       会自动跳过；纯 fs 的 git/todo 任何模式都跑
+    aggressiveness: normal
+    # 单 scanner 单 project 最多返回几条
+    limitPerScanner: 5
+    # daemon 自循环是否自动跑队列顶项到 design 阶段
+    # **只有 mode=normal 才会真执行**；degraded 仍只扫描入队
+    autoExecute: false
+    # 扫描时是否允许 spawn 子进程（npm outdated / test）。**且需要 mode=normal**
+    allowShellDuringScan: false
+    # 只扫描这些项目；空 = 全部
+    onlyProjects: []
+
+# ----------------------------------------------------------------------------
+# 动作策略（M1~M2 全 dry-run，M3 起逐步放开）
+# ----------------------------------------------------------------------------
+actions:
+  # 默认模式：dry-run（只产出 vault 笔记和计划，不动代码）
+  defaultMode: dry-run
+  # 始终放行的只读动作
+  alwaysAllow:
+    - file.read
+    - file.search
+    - git.status
+    - git.diff
+    - git.log
+  # 高危动作：必须 CLI `overseer approve` 才放行
+  requiresApproval:
+    - git.push
+    - git.reset
+    - git.force_checkout
+    - file.delete_untracked
+    - file.modify_main_branch
+    - cross_project_change
+  # 每次开发动作前自动 git snapshot 的项目白名单（M3 起填）
+  writeAllowedProjects: []
+
+# ----------------------------------------------------------------------------
+# 日志
+# ----------------------------------------------------------------------------
+logging:
+  level: info                # trace | debug | info | warn | error
+  pretty: true               # 终端彩色输出；生产可关闭
+  file: logs/overseer.log

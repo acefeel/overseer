@@ -1,0 +1,5 @@
+{
+  "folder": "overSeer/daily",
+  "format": "YYYY-MM-DD",
+  "template": "templates/daily"
+}

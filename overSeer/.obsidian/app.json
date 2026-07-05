@@ -1,0 +1,13 @@
+{
+  "alwaysUpdateLinks": true,
+  "newFileFolderPath": "current",
+  "attachmentFolderPath": "overSeer/assets",
+  "useMarkdownLinks": false,
+  "newLinkFormat": "shortest",
+  "promptDelete": false,
+  "strictLineBreaks": false,
+  "showInlineTitle": true,
+  "showLineNumber": true,
+  "spellcheck": false,
+  "tabSize": 2
+}

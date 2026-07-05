@@ -1,0 +1,41 @@
+{
+  "name": "overseer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Autonomous coding supervisor with budget awareness and Obsidian knowledge base",
+  "bin": {
+    "overseer": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli/index.ts",
+    "start:daemon": "tsx src/daemon/index.ts",
+    "start:tui": "tsx src/tui/index.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.2.1",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "gray-matter": "^4.0.3",
+    "ink": "^5.0.1",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0",
+    "react": "^18.3.1",
+    "simple-git": "^3.27.0",
+    "yaml": "^2.6.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

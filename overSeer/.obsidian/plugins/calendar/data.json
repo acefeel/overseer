@@ -1,0 +1,7 @@
+{
+  "folder": "overSeer/daily",
+  "showWeeklyNote": false,
+  "weekStart": "monday",
+  "wordsPerDot": 250,
+  "format": "YYYY-MM-DD"
+}

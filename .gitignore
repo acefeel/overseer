@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+*.tsbuildinfo
+
+# runtime
+data/
+logs/
+
+# secrets (NEVER commit)
+config/.secrets.yaml
+config/overseer.config.local.yaml
+.env
+.env.local
+
+# os
+Thumbs.db
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+
+# obsidian workspace (keep .obsidian config, ignore workspace cache)
+vault/.obsidian/workspace*.json
+vault/.obsidian/cache
