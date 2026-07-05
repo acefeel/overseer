@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, AppConfigSchema } from '../../util/config.js';
+import { loadConfig, AppConfigSchema, isProviderReady } from '../../util/config.js';
 import { PATHS } from '../../util/paths.js';
 import { Router } from '../../providers/router.js';
 import { HealthProbe } from '../../providers/health.js';
@@ -19,7 +19,26 @@ interface Check {
 export async function runDoctor(): Promise<void> {
   const checks: Check[] = [];
 
-  // 1. 配置文件可解析
+  // 1. Node 版本
+  const nodeVersion = process.version;
+  const nodeMajor = Number(nodeVersion.slice(1).split('.')[0]);
+  checks.push({
+    name: 'Node.js 版本',
+    ok: nodeMajor >= 20,
+    message: nodeVersion,
+    fix: '升级到 Node.js >= 20',
+  });
+
+  // 2. 依赖安装
+  let depsOk = fs.existsSync(path.join(PATHS.ROOT, 'node_modules', 'commander', 'package.json'));
+  checks.push({
+    name: '依赖安装',
+    ok: depsOk,
+    message: depsOk ? 'node_modules 存在' : 'node_modules 缺失',
+    fix: '运行 npm install',
+  });
+
+  // 3. 配置文件可解析
   try {
     loadConfig({ force: true });
     checks.push({ name: '配置解析', ok: true, message: 'overseer.config.yaml 可解析' });
@@ -32,7 +51,7 @@ export async function runDoctor(): Promise<void> {
     });
   }
 
-  // 2. 目录权限
+  // 4. 目录权限
   const dirsOk = ensureDirs();
   checks.push({
     name: '运行时目录',
@@ -41,7 +60,7 @@ export async function runDoctor(): Promise<void> {
     fix: '检查项目根目录写权限',
   });
 
-  // 3. vault 可写
+  // 5. vault 可写
   let vaultOk = false;
   let vaultMsg = '';
   try {
@@ -62,16 +81,23 @@ export async function runDoctor(): Promise<void> {
     fix: '检查 vault/ 目录写权限，或调整配置 vault.root',
   });
 
-  // 4. provider ready
+  // 6. provider ready
   let providerOk = false;
   let providerMsg = '';
-  let providerChecks: { id: string; ready: boolean; reachable: boolean }[] = [];
+  const providerChecks: { id: string; ready: boolean; reachable: boolean; hasKey: boolean }[] = [];
   try {
     const cfg = loadConfig();
     const router = new Router(cfg);
     const probe = new HealthProbe(cfg, 0);
     const all = await probe.checkAll();
-    providerChecks = all.map((h) => ({ id: h.id, ready: h.ready, reachable: h.reachable }));
+    providerChecks.push(
+      ...all.map((h) => ({
+        id: h.id,
+        ready: h.ready,
+        reachable: h.reachable,
+        hasKey: isProviderReady(h.id),
+      }))
+    );
     providerOk = router.mainChainReady() || router.hasFallback();
     const mainReady = router.mainChainReady();
     const fbReady = router.hasFallback();
@@ -79,19 +105,23 @@ export async function runDoctor(): Promise<void> {
   } catch (e) {
     providerMsg = `provider 检查失败: ${(e as Error).message}`;
   }
+  const failedProviders = providerChecks.filter((p) => !p.ready);
   checks.push({
     name: 'Provider 可用性',
     ok: providerOk,
     message: providerMsg,
-    fix: providerChecks.length > 0
-      ? providerChecks
-          .filter((p) => !p.ready)
-          .map((p) => `${p.id}: ready=${p.ready}, reachable=${p.reachable}`)
+    fix: failedProviders.length > 0
+      ? failedProviders
+          .map((p) => {
+            if (!p.hasKey && p.id !== 'local') return `${p.id}: 缺少 apiKey（环境变量 OVERSEER_${p.id.toUpperCase()}_API_KEY 或 .secrets.yaml）`;
+            if (p.id === 'local' && !p.reachable) return `${p.id}: Ollama 未运行（http://localhost:11434/v1）`;
+            return `${p.id}: ready=${p.ready}, reachable=${p.reachable}`;
+          })
           .join('; ') || '配置 apiKey 或启用 local fallback'
       : '检查 providers 配置',
   });
 
-  // 5. git 可用
+  // 7. git 可用
   let gitOk = false;
   let gitMsg = '';
   try {
@@ -108,7 +138,7 @@ export async function runDoctor(): Promise<void> {
     fix: '安装 git 并确保它在 PATH 中',
   });
 
-  // 6. 项目扫描
+  // 8. 项目扫描
   let projectsOk = false;
   let projectsMsg = '';
   try {
@@ -125,7 +155,7 @@ export async function runDoctor(): Promise<void> {
     fix: '检查 workspace.root 配置与目录权限',
   });
 
-  // 7. schema 校验
+  // 9. schema 校验
   let schemaOk = false;
   let schemaMsg = '';
   try {
@@ -141,6 +171,29 @@ export async function runDoctor(): Promise<void> {
     ok: schemaOk,
     message: schemaMsg,
     fix: '对照 config/.secrets.example.yaml 与 AGENTS.md 第 5 节检查字段',
+  });
+
+  // 10. 密钥文件未误提交（git status 检查）
+  let secretSafe = true;
+  let secretMsg = '.secrets.yaml 不在 git 跟踪中';
+  try {
+    const tracked = execSync('git ls-files config/.secrets.yaml', {
+      encoding: 'utf8',
+      cwd: PATHS.ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (tracked) {
+      secretSafe = false;
+      secretMsg = '警告：config/.secrets.yaml 已被 git 跟踪，存在泄漏风险';
+    }
+  } catch {
+    /* 可能不是 git 仓库 */
+  }
+  checks.push({
+    name: '密钥安全',
+    ok: secretSafe,
+    message: secretMsg,
+    fix: '运行 git rm --cached config/.secrets.yaml 并确认 .gitignore 包含它',
   });
 
   // 输出

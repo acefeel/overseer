@@ -19,6 +19,10 @@ config/overseer.config.local.yaml
 Thumbs.db
 .DS_Store
 
+# installer test artifacts
+*.doctor-write-test
+.overseer-doctor-test
+
 # editor
 .vscode/
 .idea/

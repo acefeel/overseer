@@ -66,10 +66,20 @@ export function writeManifest(projectRootAbs: string, m: Partial<ProjectManifest
 
 export function initManifest(
   projectRootAbs: string,
-  opts: { allowWrite?: boolean; testCommand?: string } = {}
+  opts: { allowWrite?: boolean; testCommand?: string; notes?: string } = {}
 ): ProjectManifest {
+  const existing = readManifest(projectRootAbs);
+  if (existing.allowWrite || existing.testCommand || existing.notes) {
+    // 已有非空 manifest，只更新显式传入的字段
+    return writeManifest(projectRootAbs, {
+      allowWrite: opts.allowWrite ?? existing.allowWrite,
+      testCommand: opts.testCommand ?? existing.testCommand,
+      notes: opts.notes ?? existing.notes,
+    });
+  }
   return writeManifest(projectRootAbs, {
     allowWrite: opts.allowWrite ?? false,
     testCommand: opts.testCommand ?? '',
+    notes: opts.notes ?? '',
   });
 }
