@@ -10,6 +10,7 @@ import type { ModePolicy } from '../daemon/mode.js';
 import type { SupervisionMode } from '../daemon/mode.js';
 import { isProtected } from '../util/glob.js';
 import * as approvals from './approvals.js';
+import { VaultRecorder } from '../kb/recorder.js';
 
 export interface ActionResult {
   ok: boolean;
@@ -28,6 +29,8 @@ export interface ExecOptions {
   skipSnapshot?: boolean;
   /** 高危动作不创建 approval，直接拒绝 */
   noApproval?: boolean;
+  /** 把动作结果写入 vault（默认 true） */
+  recordVault?: boolean;
 }
 
 /**
@@ -48,15 +51,22 @@ export class ActionExecutor {
   readonly git: ProjectGit;
   readonly snapshotter: Snapshotter;
   readonly rollback: Rollback;
+  private recorder?: VaultRecorder;
 
   constructor(
     public readonly project: ProjectInfo,
     public readonly modePolicy: ModePolicy,
-    public readonly currentMode: () => SupervisionMode
+    public readonly currentMode: () => SupervisionMode,
+    recorder?: VaultRecorder
   ) {
     this.git = new ProjectGit(project.rootAbs);
     this.snapshotter = new Snapshotter(this.git);
     this.rollback = new Rollback(this.git);
+    this.recorder = recorder;
+  }
+
+  setRecorder(recorder: VaultRecorder): void {
+    this.recorder = recorder;
   }
 
   private gate(action: string, opts: ExecOptions): { ok: boolean; reason?: string } {
@@ -69,14 +79,34 @@ export class ActionExecutor {
     return { ok: true };
   }
 
+  private record(action: string, result: ActionResult, opts: ExecOptions): void {
+    if (opts.recordVault === false) return;
+    if (!this.recorder) return;
+    void this.recorder.actionEvent(this.project.id, action, {
+      ok: result.ok,
+      error: result.error,
+      detail: {
+        snapshotId: result.snapshot?.id,
+        approval: result.approval,
+        code: (result as any).code,
+      },
+    });
+  }
+
   async writeFile(relPath: string, content: string, opts: ExecOptions = {}): Promise<ActionResult> {
     const action = 'file.write';
     const g = this.gate(action, opts);
-    if (!g.ok) return this.fail(action, g.reason!);
+    if (!g.ok) {
+      const r = this.fail(action, g.reason!);
+      this.record(action, r, opts);
+      return r;
+    }
 
     const manifest = readManifest(this.project.rootAbs);
     if (!manifest.allowWrite && !opts.bypassGate) {
-      return this.fail(action, `project ${this.project.id} has allowWrite=false (set .overseer.json)`);
+      const r = this.fail(action, `project ${this.project.id} has allowWrite=false (set .overseer.json)`);
+      this.record(action, r, opts);
+      return r;
     }
 
     const rel = path.isAbsolute(relPath)
@@ -84,10 +114,12 @@ export class ActionExecutor {
       : relPath;
     const protectedHit = isProtected(rel.replace(/\\/g, '/'), manifest.protectedPaths);
     if (protectedHit && !opts.bypassGate) {
-      return this.fail(
+      const r = this.fail(
         action,
         `refuse to modify protected path "${rel}" (matches manifest.protectedPaths). Self-protection.`
       );
+      this.record(action, r, opts);
+      return r;
     }
 
     let snap: Snapshot | undefined;
@@ -95,7 +127,9 @@ export class ActionExecutor {
       try {
         snap = await this.snapshotter.take(`before ${action}: ${relPath}`);
       } catch (e) {
-        return this.fail(action, `snapshot failed: ${(e as Error).message}`);
+        const r = this.fail(action, `snapshot failed: ${(e as Error).message}`);
+        this.record(action, r, opts);
+        return r;
       }
     }
 
@@ -104,16 +138,24 @@ export class ActionExecutor {
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, content, 'utf8');
       this.log.info({ project: this.project.id, relPath, snap: snap?.id }, 'file written');
-      return { ok: true, action, project: this.project.id, snapshot: snap };
+      const r: ActionResult = { ok: true, action, project: this.project.id, snapshot: snap };
+      this.record(action, r, opts);
+      return r;
     } catch (e) {
-      return this.fail(action, (e as Error).message, snap);
+      const r = this.fail(action, (e as Error).message, snap);
+      this.record(action, r, opts);
+      return r;
     }
   }
 
   async runShell(command: string, opts: ExecOptions = {}): Promise<ActionResult & { stdout?: string; stderr?: string; code?: number }> {
     const action = 'shell.exec';
     const g = this.gate(action, opts);
-    if (!g.ok) return { ...this.fail(action, g.reason!), stdout: '', stderr: g.reason, code: 1 };
+    if (!g.ok) {
+      const r = { ...this.fail(action, g.reason!), stdout: '', stderr: g.reason, code: 1 };
+      this.record(action, r, opts);
+      return r;
+    }
 
     const manifest = readManifest(this.project.rootAbs);
     const allowed = manifest.allowExec.some((prefix) => command.startsWith(prefix));
@@ -125,7 +167,7 @@ export class ActionExecutor {
         context: { manifestAllowExec: manifest.allowExec },
       });
       this.log.warn({ approvalId: appr.id, command }, 'shell.exec needs approval');
-      return {
+      const r = {
         ok: false,
         action,
         project: this.project.id,
@@ -135,6 +177,8 @@ export class ActionExecutor {
         stderr: 'pending approval',
         code: 126,
       };
+      this.record(action, r, opts);
+      return r;
     }
 
     let snap: Snapshot | undefined;
@@ -142,7 +186,9 @@ export class ActionExecutor {
       try {
         snap = await this.snapshotter.take(`before ${action}: ${command}`);
       } catch (e) {
-        return { ...this.fail(action, `snapshot failed: ${(e as Error).message}`), stdout: '', stderr: (e as Error).message, code: 1 };
+        const r = { ...this.fail(action, `snapshot failed: ${(e as Error).message}`), stdout: '', stderr: (e as Error).message, code: 1 };
+        this.record(action, r, opts);
+        return r;
       }
     }
 
@@ -165,7 +211,7 @@ export class ActionExecutor {
         { project: this.project.id, command, code: result.code, snap: snap?.id },
         'shell done'
       );
-      return {
+      const r = {
         ok: result.code === 0,
         action,
         project: this.project.id,
@@ -174,24 +220,34 @@ export class ActionExecutor {
         stderr: result.stderr,
         code: result.code,
       };
+      this.record(action, r, opts);
+      return r;
     } catch (e) {
-      return {
+      const r = {
         ...this.fail(action, (e as Error).message, snap),
         stdout: '',
         stderr: (e as Error).message,
         code: 1,
       };
+      this.record(action, r, opts);
+      return r;
     }
   }
 
   async gitCommit(message: string, opts: ExecOptions = {}): Promise<ActionResult> {
     const action = 'git.commit';
     const g = this.gate(action, opts);
-    if (!g.ok) return this.fail(action, g.reason!);
+    if (!g.ok) {
+      const r = this.fail(action, g.reason!);
+      this.record(action, r, opts);
+      return r;
+    }
 
     const manifest = readManifest(this.project.rootAbs);
     if (!manifest.allowWrite && !opts.bypassGate) {
-      return this.fail(action, `project ${this.project.id} has allowWrite=false`);
+      const r = this.fail(action, `project ${this.project.id} has allowWrite=false`);
+      this.record(action, r, opts);
+      return r;
     }
 
     let snap: Snapshot | undefined;
@@ -199,7 +255,9 @@ export class ActionExecutor {
       try {
         snap = await this.snapshotter.take(`before ${action}: ${message}`, undefined, { noStash: true });
       } catch (e) {
-        return this.fail(action, `snapshot failed: ${(e as Error).message}`);
+        const r = this.fail(action, `snapshot failed: ${(e as Error).message}`);
+        this.record(action, r, opts);
+        return r;
       }
     }
 
@@ -207,9 +265,13 @@ export class ActionExecutor {
       await this.git.addAll();
       const sha = await this.git.commit(`[overseer] ${message}`);
       this.log.info({ project: this.project.id, sha: sha.slice(0, 8), snap: snap?.id }, 'committed');
-      return { ok: true, action, project: this.project.id, snapshot: snap, detail: { sha } };
+      const r: ActionResult = { ok: true, action, project: this.project.id, snapshot: snap, detail: { sha } };
+      this.record(action, r, opts);
+      return r;
     } catch (e) {
-      return this.fail(action, (e as Error).message, snap);
+      const r = this.fail(action, (e as Error).message, snap);
+      this.record(action, r, opts);
+      return r;
     }
   }
 

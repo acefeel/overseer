@@ -1,6 +1,7 @@
 import type { AppConfig, ProviderConfig } from '../util/config.js';
 import { getLogger } from '../util/logger.js';
 import { getTracker } from '../budget/tracker.js';
+import type { VaultRecorder } from '../kb/recorder.js';
 import type {
   ChatRequest,
   ChatResponse,
@@ -32,6 +33,8 @@ export class Router {
   private fallbackId?: string;
   private taskRouting: Record<string, string>;
   private log = getLogger('router');
+
+  private recorder?: VaultRecorder;
 
   constructor(cfg: AppConfig) {
     this.taskRouting = { ...cfg.router.taskRouting };
@@ -67,6 +70,11 @@ export class Router {
       { chain: this.chain, fallback: this.fallbackId ?? null, all: [...this.providers.keys()] },
       'router initialized'
     );
+  }
+
+  /** 注入 VaultRecorder，用于把 provider 事件写入知识库 */
+  setRecorder(recorder: VaultRecorder): void {
+    this.recorder = recorder;
   }
 
   get activeChain(): string[] {
@@ -164,6 +172,13 @@ export class Router {
         });
       }
     }
+    if (this.recorder) {
+      void this.recorder.providerEvent(p.id, 'unreachable', {
+        task,
+        attemptedModels,
+        error: lastErr?.message,
+      });
+    }
     throw lastErr ?? new ProviderError('worker chat failed', 'router');
   }
 
@@ -208,6 +223,13 @@ export class Router {
           attemptedModels,
         });
       }
+    }
+    if (this.recorder) {
+      void this.recorder.providerEvent(p.id, 'unreachable', {
+        task,
+        attemptedModels,
+        error: lastErr?.message,
+      });
     }
     throw lastErr ?? new ProviderError('consultant chat failed', 'router');
   }
@@ -312,6 +334,14 @@ export class Router {
         }
       }
     }
+    if (this.recorder) {
+      void this.recorder.providerEvent(preferred?.id ?? this.chain[0] ?? 'main', 'unreachable', {
+        task,
+        tried,
+        attemptedModels,
+        error: lastErr?.message,
+      });
+    }
     throw new ProviderError(
       `all main providers exhausted (tried: ${tried.join(', ') || 'none'}). last=${
         lastErr?.message ?? 'unknown'
@@ -373,6 +403,13 @@ export class Router {
           attemptedModels,
         });
       }
+    }
+    if (this.recorder) {
+      void this.recorder.providerEvent(p.id, 'unreachable', {
+        task,
+        attemptedModels,
+        error: lastErr?.message,
+      });
     }
     throw lastErr ?? new ProviderError('fallback chat failed', 'router');
   }

@@ -3,6 +3,8 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import type { Note } from './schema.js';
 
+const WIKILINK_RE = /\[\[([^\]\|#]+)(?:\|[^\]]+)?(?:#[^\]]+)?\]\]/g;
+
 export interface IndexedNote extends Note {
   _mtime: number;
 }
@@ -69,9 +71,7 @@ export class VaultIndex {
     try {
       const raw = fs.readFileSync(abs, 'utf8');
       const parsed = matter(raw);
-      const links = [...parsed.content.matchAll(/\[\([^\]\|#]+(?:\|[^\]]+)?(?:#[^\]]+)?\]\]/g)].map(
-        (m) => m[1]
-      );
+      const links = [...parsed.content.matchAll(WIKILINK_RE)].map((m) => m[1]);
       const rel = path.relative(this.vaultRootAbs, abs).replace(/\\/g, '/');
       const note: IndexedNote = {
         path: abs,

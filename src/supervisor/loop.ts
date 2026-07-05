@@ -16,6 +16,8 @@ import { CodeChangeGenerator, type FileChange } from './codegen.js';
 import * as approvals from './approvals.js';
 import type { QueueItem } from './queue.js';
 
+import { VaultRecorder } from '../kb/recorder.js';
+
 export interface CycleResult {
   project: string;
   phase: 'plan' | 'design' | 'develop' | 'test' | 'evaluate';
@@ -92,6 +94,15 @@ export class PdcaeLoop {
     this.seedElevator = new SeedElevator(router);
   }
 
+  private get recorder(): VaultRecorder {
+    return (this.writer as any).__recorder ?? new VaultRecorder(this.writer);
+  }
+
+  /** 注入 VaultRecorder，让 plan/design/develop 等事件统一记录 */
+  setRecorder(recorder: VaultRecorder): void {
+    (this.writer as any).__recorder = recorder;
+  }
+
   async plan(projectIdOrRel: string, hint?: string): Promise<CycleResult & { intentions: Intention[] }> {
     const project = findProject(projectIdOrRel);
     if (!project) {
@@ -126,6 +137,10 @@ export class PdcaeLoop {
       body: `> 由 [[overSeer/knowledge/memory-judge|意向生成器]] 产出 ${items.length} 个候选。\n\n${planBody}`,
     });
     this.log.info({ project: project.id, count: items.length, note: note.note.relativePath }, 'plan done');
+    void this.recorder.queueEvent(project.id, 'added', {
+      title: `Plan ${items.length} 项`,
+      reason: hint ? `hint: ${hint}` : 'scheduled scan',
+    });
     return {
       project: project.id,
       phase: 'plan',
@@ -231,7 +246,6 @@ export class PdcaeLoop {
       return this.designOnly(project, intent);
     }
 
-    // 主控不可用 → 拒绝（degraded 永远不能写代码）
     const mode = this.currentMode();
     if (mode !== 'normal') {
       return {
@@ -357,6 +371,18 @@ export class PdcaeLoop {
       testRun,
     });
 
+    void this.recorder.actionEvent(project.id, 'develop', {
+      ok: true,
+      detail: {
+        intentionId,
+        changes: codegenRes.changes.length,
+        applied: applied.filter((a) => a.ok).length,
+        rejected: codegenRes.rejected.length,
+        testCommand: testRun?.command,
+        testOk: testRun?.ok,
+      },
+    });
+
     return {
       project: project.id,
       phase: 'evaluate',
@@ -421,6 +447,7 @@ export class PdcaeLoop {
 
   private failed(phase: CycleResult['phase'], error: string): any {
     this.log.error({ phase, err: error }, 'cycle failed');
+    void this.recorder.actionEvent('overSeer', phase, { ok: false, error });
     return {
       project: '?',
       phase,

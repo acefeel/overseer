@@ -10,6 +10,7 @@ import type { IpcHandler, IpcRequest } from './ipc.js';
 import { Vault } from '../kb/vault.js';
 import { VaultWriter } from '../kb/writer.js';
 import { VaultRetriever } from '../kb/retriever.js';
+import { VaultSearcher } from '../kb/searcher.js';
 import { MemoryJudge, type JudgeDecision } from '../kb/judge.js';
 import type { NoteType } from '../kb/schema.js';
 import {
@@ -61,6 +62,8 @@ const SYSTEM_BASE_DEGRADED =
   '回答要简明、坦诚；若用户要做有副作用的操作，告知预算恢复后再来。' +
   '当被问及健康/预算，根据【已有记忆】和【状态快照】如实回答。';
 
+import { VaultRecorder } from '../kb/recorder.js';
+
 export class Supervisor {
   readonly router: Router;
   readonly budget: BudgetPolicy;
@@ -69,6 +72,8 @@ export class Supervisor {
   readonly retriever: VaultRetriever;
   readonly judge: MemoryJudge;
   readonly modePolicy: ModePolicy;
+  readonly recorder: VaultRecorder;
+  readonly searcher: VaultSearcher;
   private log = getLogger('supervisor');
   private history: ChatTurn[] = [];
   private currentMode: SupervisionMode = 'normal';
@@ -76,12 +81,15 @@ export class Supervisor {
 
   constructor() {
     const cfg = loadConfig();
-    this.router = new Router(cfg);
-    this.budget = new BudgetPolicy(cfg.budget, getTracker());
     this.vault = new Vault();
     this.vault.ensure();
     this.writer = new VaultWriter(this.vault);
+    this.recorder = new VaultRecorder(this.writer);
+    this.router = new Router(cfg);
+    this.router.setRecorder(this.recorder);
+    this.budget = new BudgetPolicy(cfg.budget, getTracker());
     this.retriever = new VaultRetriever(this.vault);
+    this.searcher = new VaultSearcher(this.retriever);
     this.judge = new MemoryJudge(this.router);
     this.modePolicy = new ModePolicy();
     this.recomputeMode();
@@ -112,7 +120,7 @@ export class Supervisor {
   private async recordModeTransition(prev: SupervisionMode, decision: ModeDecision): Promise<void> {
     if (!this.vault) return;
     try {
-      this.writer.write({
+      const result = this.writer.write({
         type: 'budget',
         project: 'overSeer',
         title: `mode ${prev}→${decision.mode} (${decision.trigger})`,
@@ -127,12 +135,16 @@ export class Supervisor {
           '',
           '## 语义',
           decision.mode === 'degraded'
-            ? '主控不可用或预算逼近上限；改由本地 fallback 接管 chat/调度；**禁止任何写/删/执行动作**。'
+            ? '主控不可用或预算逼近上限；改由本地 fallback 接管 chat/调度；后续副作用动作仍受 manifest + approvals 约束。'
             : decision.mode === 'stopped'
             ? '主控不可用且无可用的 fallback，daemon 暂停所有 LLM 调用。'
             : '主控恢复可用且预算正常，切回主控，恢复完整能力。',
         ].join('\n'),
       });
+      this.writer.appendDaily(
+        `mode ${prev}→${decision.mode}`,
+        `触发=${decision.trigger} · 预算=${decision.fromLevel}\n\n[[${result.note.relativePath.replace(/\.md$/, '')}]]`
+      );
     } catch {
       /* non-critical */
     }
@@ -175,7 +187,7 @@ export class Supervisor {
     let contextBlock = '';
     if (!opts.noRetrieve) {
       try {
-        const hits = this.retriever.search({ q: text, limit: 5 });
+        const hits = this.searcher.search({ q: text, limit: 5 }, { linkBoost: 3, relatedDepth: 1 });
         retrieved = hits.length;
         if (retrieved > 0) {
           contextBlock =
@@ -248,7 +260,7 @@ export class Supervisor {
       ? DEGRADED_BANNER + degradedReasonLine(decision.trigger as any) + res.text
       : res.text;
 
-    return {
+    const chatResult: ChatResult = {
       reply,
       model: res.model,
       provider: res.providerId,
@@ -257,6 +269,42 @@ export class Supervisor {
       mode,
       degraded,
     };
+
+    // 写入 chat_log 作为审计，不依赖 judge 且不阻塞返回
+    this.recordChatLog(
+      [
+        ...messages.slice(-2).map((m) => ({ role: m.role, content: m.content } as ChatTurn)),
+        { role: 'assistant', content: res.text },
+      ],
+      chatResult
+    ).catch((e: Error) => this.log.warn({ err: String(e) }, 'recordChatLog failed'));
+
+    return chatResult;
+  }
+
+  private async recordChatLog(turns: ChatTurn[], result: ChatResult): Promise<void> {
+    if (turns.length === 0) return;
+    try {
+      const lines = turns.map((t) => `## ${t.role}\n\n${t.content}`);
+      this.writer.write({
+        type: 'chat_log',
+        project: 'overSeer',
+        title: `chat ${new Date().toISOString()} - ${result.provider}/${result.model}`,
+        tags: ['chat_log', result.mode, result.provider],
+        body: [
+          ...lines,
+          '',
+          `## meta`,
+          `- provider: ${result.provider}`,
+          `- model: ${result.model}`,
+          `- mode: ${result.mode}`,
+          `- retrievedNotes: ${result.retrievedNotes}`,
+          `- memoryWritten: ${result.memoryWritten ? `${result.memoryWritten.type}→[[${result.memoryWritten.rel}]]` : '(none)'}`,
+        ].join('\n'),
+      });
+    } catch (e) {
+      this.log.warn({ err: String(e) }, 'recordChatLog failed');
+    }
   }
 
   private async maybeWriteMemory(
@@ -369,15 +417,23 @@ export class Supervisor {
         }
         case 'kb.search': {
           const q = (req.payload as Record<string, unknown>) ?? {};
-          return this.retriever.search({
-            q: q.q as string | undefined,
-            type: q.type as NoteType | undefined,
-            project: q.project as string | undefined,
-            tag: q.tag as string | undefined,
-            status: q.status as string | undefined,
-            since: q.since as string | undefined,
-            limit: q.limit as number | undefined,
-          });
+          return this.searcher.search(
+            {
+              q: q.q as string | undefined,
+              type: q.type as NoteType | undefined,
+              project: q.project as string | undefined,
+              tag: q.tag as string | undefined,
+              status: q.status as string | undefined,
+              since: q.since as string | undefined,
+              limit: q.limit as number | undefined,
+            },
+            { linkBoost: (q.linkBoost as number) ?? 2, relatedDepth: (q.relatedDepth as number) ?? 0 }
+          );
+        }
+        case 'kb.related': {
+          const p = (req.payload as { rel?: string; limit?: number }) ?? {};
+          if (!p.rel) throw new Error("missing 'rel' in kb.related payload");
+          return this.searcher.related(p.rel, p.limit ?? 5);
         }
         case 'kb.recent': {
           const p = (req.payload as { limit?: number; type?: NoteType }) ?? {};

@@ -19,6 +19,7 @@ import type { Router } from '../providers/router.js';
 import type { ModePolicy } from '../daemon/mode.js';
 import type { SupervisionMode } from '../daemon/mode.js';
 import type { BudgetPolicy } from '../budget/policy.js';
+import { VaultRecorder } from '../kb/recorder.js';
 import type { VaultWriter } from '../kb/writer.js';
 import { PdcaeLoop } from './loop.js';
 
@@ -70,6 +71,7 @@ export interface AutonomyDeps {
   modePolicy: ModePolicy;
   budget: BudgetPolicy;
   writer: VaultWriter;
+  recorder?: VaultRecorder;
   currentMode: () => SupervisionMode;
   recomputeMode: () => { decision: { mode: SupervisionMode }; changed: boolean };
 }
@@ -82,8 +84,10 @@ export interface AutonomyDeps {
 export class Autonomy {
   private log = getLogger('autonomy');
   readonly pdcae: PdcaeLoop;
+  private recorder: VaultRecorder;
 
   constructor(public readonly deps: AutonomyDeps) {
+    this.recorder = deps.recorder ?? new VaultRecorder(deps.writer);
     this.pdcae = new PdcaeLoop(
       deps.router,
       deps.modePolicy,
@@ -91,6 +95,7 @@ export class Autonomy {
       deps.writer,
       (est) => deps.budget.canRunTask(est)
     );
+    this.pdcae.setRecorder(this.recorder);
   }
 
   async runCycle(override?: Partial<CycleConfig>): Promise<CycleOutcome> {
