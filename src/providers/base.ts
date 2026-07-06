@@ -12,7 +12,7 @@ export interface ChatRequest {
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
-  task?: 'chat' | 'planning' | 'embedding' | 'summary';
+  task?: 'chat' | 'planning' | 'embedding' | 'summary' | 'chat-tools';
 }
 
 export interface TokenUsage {

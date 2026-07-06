@@ -43,6 +43,10 @@ export const DaemonConfigSchema = z.object({
     allowShellDuringScan: z.boolean().default(false),
     onlyProjects: z.array(z.string()).default([]),
   }).default({}),
+  chat: z.object({
+    confirmLevel: z.enum(['paranoid', 'normal', 'none']).default('normal'),
+    allowActions: z.boolean().default(true),
+  }).default({}),
 });
 
 export const ActionsConfigSchema = z.object({
@@ -68,9 +72,14 @@ export const LoggingConfigSchema = z.object({
 
 export const AppConfigSchema = z.object({
   workspace: z.object({
-    root: z.string().default('..'),
+    root: z.string().default('.'),
     watchProjects: z.array(z.string()).default([]),
     ignore: z.array(z.string()).default([]),
+    /**
+     * 当 workspace 未被显式设置（仍为默认值）时，CLI 启动是否交互提示用户选择工作目录。
+     * 默认 true。可通过 `overseer workspace set` 持久化或 `--workspace` 参数避免提示。
+     */
+    promptIfUnset: z.boolean().default(true),
   }),
   vault: VaultConfigSchema,
   providers: z.record(z.string(), ProviderConfigSchema),

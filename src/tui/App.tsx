@@ -3,6 +3,7 @@ import { Box, Text, useApp, useStdin, useInput } from 'ink';
 import { StatusBar } from './components/StatusBar.js';
 import { QueueList, type QueueItem as TuiQueueItem } from './components/QueueList.js';
 import { ActivityLog, type ActivityEntry } from './components/ActivityLog.js';
+import { LogTail } from './components/LogTail.js';
 import { HelpBar } from './components/HelpBar.js';
 import { TaskLoopPanel, type TaskLoopData } from './components/TaskLoopPanel.js';
 import { ActionMenu } from './components/ActionMenu.js';
@@ -53,12 +54,19 @@ interface StatusData {
   taskLoop: TaskLoopData | null;
 }
 
+interface LogTailData {
+  lines: string[];
+  size?: number;
+  error?: string;
+}
+
 interface AppState {
   daemonAlive: boolean;
   daemonStarting: boolean;
   status: StatusData | null;
   queue: TuiQueueItem[];
   activity: ActivityEntry[];
+  logs: LogTailData;
   lastAction?: string;
   error?: string;
 }
@@ -144,6 +152,7 @@ export function App() {
     status: null,
     queue: [],
     activity: [],
+    logs: { lines: [] },
   });
   const [page, setPage] = useState<Page>('dashboard');
   const [menuIndex, setMenuIndex] = useState(0);
@@ -172,6 +181,24 @@ export function App() {
       const recent = (await ipc
         .request('kb.recent', { limit: 8 })
         .catch(() => [])) as any[];
+      const queueRes = (await ipc
+        .request('queue.list', { limit: 12 })
+        .catch(() => [])) as any[];
+      const queue: TuiQueueItem[] = Array.isArray(queueRes)
+        ? queueRes.map((q: any) => ({
+            id: String(q?.id ?? ''),
+            project: String(q?.project ?? ''),
+            source: String(q?.source ?? ''),
+            category: String(q?.category ?? ''),
+            severity: String(q?.severity ?? ''),
+            title: String(q?.title ?? ''),
+            status: String(q?.status ?? ''),
+            lastSeen: String(q?.lastSeen ?? ''),
+          }))
+        : [];
+      const logsRes = (await ipc
+        .request('logs.tail', { limit: 120 })
+        .catch(() => ({ lines: [] }))) as { lines?: string[]; size?: number; error?: string };
       const activity: ActivityEntry[] = [];
       for (const note of recent) {
         const fm = note.frontmatter || {};
@@ -194,7 +221,9 @@ export function App() {
         daemonAlive: true,
         daemonStarting: false,
         status,
+        queue,
         activity,
+        logs: { lines: logsRes.lines ?? [], size: logsRes.size, error: logsRes.error },
         lastAction: s.lastAction,
         error: undefined,
       }));
@@ -231,7 +260,7 @@ export function App() {
         await autoStartOnce();
       }
     })();
-    const id = setInterval(refresh, 4000);
+    const id = setInterval(refresh, 1500);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -310,12 +339,8 @@ export function App() {
           <ActionMenu
             items={MENU_ITEMS}
             selected={menuIndex}
-            onSelect={(idx) => {
-              if (typeof idx === 'number') {
-                setMenuIndex(idx);
-                setPage(MENU_ITEMS[idx].key as Page);
-              }
-            }}
+            onChange={(idx) => setMenuIndex(idx)}
+            onSelect={(idx) => setPage(MENU_ITEMS[idx].key as Page)}
             onClose={() => setPage('dashboard')}
           />
         );
@@ -351,14 +376,23 @@ export function App() {
       {!dashboardVisible ? (
         <Box marginTop={1}>{renderPage()}</Box>
       ) : (
-        <Box marginTop={1}>
-          <Box flexDirection="column" width="60%">
-            <QueueList items={state.queue} />
+        <>
+          <Box marginTop={1}>
+            <Box flexDirection="column" width="60%">
+              <QueueList items={state.queue} />
+            </Box>
+            <Box flexDirection="column" width="40%">
+              <ActivityLog entries={state.activity} />
+            </Box>
           </Box>
-          <Box flexDirection="column" width="40%">
-            <ActivityLog entries={state.activity} />
+          <Box marginTop={1} flexDirection="column">
+            <LogTail
+              lines={state.logs.lines}
+              totalSize={state.logs.size}
+              error={state.logs.error}
+            />
           </Box>
-        </Box>
+        </>
       )}
 
       <Box marginTop={1}>

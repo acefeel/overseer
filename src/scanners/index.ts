@@ -20,7 +20,7 @@ export interface AggregateOptions {
 
 export const DEFAULT_ENABLED: Scanner['id'][] = ['git', 'todo'];
 export const MEDIUM_ENABLED: Scanner['id'][] = ['git', 'todo', 'outdated'];
-export const FULL_ENABLED: Scanner['id'][] = ['git', 'todo', 'outdated', 'test'];
+export const FULL_ENABLED: Scanner['id'][] = ['git', 'todo', 'outdated', 'test', 'lint'];
 
 const REGISTRY: Record<Scanner['id'], () => Scanner> = {
   git: () => new GitScanner(),

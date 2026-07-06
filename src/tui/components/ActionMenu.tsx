@@ -9,22 +9,25 @@ export interface MenuItem {
 export interface ActionMenuProps {
   items: MenuItem[];
   selected: number;
+  /** 仅在选择项上下移动时触发，不跳转页面 */
+  onChange: (index: number) => void;
+  /** 用户按 Enter 确认当前选择时触发 */
   onSelect: (index: number) => void;
   onClose: () => void;
 }
 
-export function ActionMenu({ items, selected, onSelect, onClose }: ActionMenuProps) {
+export function ActionMenu({ items, selected, onChange, onSelect, onClose }: ActionMenuProps) {
   useInput((input, key) => {
     if (key.escape || input === 'q') {
       onClose();
       return;
     }
     if (key.upArrow) {
-      onSelect(selected <= 0 ? items.length - 1 : selected - 1);
+      onChange(selected <= 0 ? items.length - 1 : selected - 1);
       return;
     }
     if (key.downArrow) {
-      onSelect(selected >= items.length - 1 ? 0 : selected + 1);
+      onChange(selected >= items.length - 1 ? 0 : selected + 1);
       return;
     }
     if (key.return) {

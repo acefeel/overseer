@@ -99,8 +99,12 @@ export class ProjectGit {
   }
 
   async createLightweightTag(name: string, ref = 'HEAD'): Promise<void> {
-    await this.git.addTag(name);
-    void ref;
+    // simple-git 的 addTag 只能打在 HEAD；要打在指定 ref 用 raw。
+    if (ref === 'HEAD') {
+      await this.git.addTag(name);
+    } else {
+      await this.git.raw(['tag', name, ref]);
+    }
   }
 
   async listTags(): Promise<string[]> {

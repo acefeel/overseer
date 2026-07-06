@@ -322,7 +322,12 @@ budget:
 - 调用 `CodeChangeGenerator` 产出代码改动。
 - 每个文件写入前自动 `Snapshotter.take()`。
 - 写入后若 manifest 配置了 `testCommand`，自动跑测试；失败则自动 rollback 到第一个 snapshot。
-- 删除操作需要 approval。
+- **删除文件走完整审批闭环**（M5 后已闭环）：
+  1. codegen 产出 `delete` 时，`loop.ts` 在 `data/approvals.json` 创建一条 `action=file.delete` 的 pending approval，context 携带 `path`、`intentionId`、`rationale`，并跳过该文件（不立即删除）。
+  2. 用户通过 `overseer supervise approve <id>` / chat `审批通过 appr-xxx` / TUI 的 Approvals 面板批准后，三处入口都会调用 `src/supervisor/fulfill.ts` 的 `fulfill()`。
+  3. `fulfill()` 读取 `approval.context.path`，按 `normal` 模式构造 `ActionExecutor` 并调用 `deleteFile()` —— 仍然过 `ProjectManifest.allowWrite`、`protectedPaths`、自动 snapshot 三道闸门，删除前自动打快照便于 rollback。
+  4. `deleteFile` 失败（文件不存在 / 触发 protectedPaths / snapshot 失败）会写入 approval 决策日志和 daemon log，但不会改写 approval 的 `status`（保持 `approved`）。
+- 因此「删除前需用户同意」是**真闭环**：未批准绝不删，批准后才执行。
 
 ### 10.4 Snapshot / Rollback
 
@@ -336,14 +341,41 @@ budget:
 
 ## 11. 项目与 Manifest
 
+### 11.0 工作目录选择（workspace assignment）
+
+`src/util/workspace.ts` 统一解析"被监理的 workspace 根目录"。所有命令（CLI / daemon / TUI）通过 `resolveWorkspace()` 拿到同一个绝对路径，取代过去直接读 `config.workspace.root` 的做法。
+
+**解析优先级（高 → 低）：**
+
+1. **session 内存覆盖** —— CLI 全局参数 `-w/--workspace <path>`，仅本次运行生效。
+2. **环境变量 `OVERSEER_WORKSPACE`** —— `launchDaemon` spawn daemon 时自动注入，保证 daemon 与 CLI 同步。
+3. **持久化文件 `data/workspace.json`** —— `overseer workspace set <path>` 写入，daemon 与后续 CLI 共享。
+4. **配置文件 `config.workspace.root`** —— 默认 `.`。
+5. **兜底** —— overSeer 项目根目录（向后兼容）。
+
+> ⚠️ `-w/--workspace` 是 commander 全局选项，**必须放在子命令之前**：`overseer -w ../proj status`。若希望任意位置生效或供 daemon 继承，改用环境变量 `OVERSEER_WORKSPACE` 或 `overseer workspace set`。
+
+**启动时交互提示：** 当 workspace 未被显式设置（仍为默认值）且 `workspace.promptIfUnset: true`（默认）时，CLI 启动会用 `@inquirer/prompts` 提示用户选择/输入工作目录，可选"记住"（持久化）或"不再提示"（写入 local config 关闭）。非 TTY（脚本/管道/后台）自动跳过。
+
+```bash
+overseer workspace show              # 查看当前 workspace 及其来源
+overseer workspace set <path>        # 持久化设置工作目录
+overseer workspace clear             # 清除持久化，回退到 config.workspace.root
+overseer workspace list [dir]        # 列出含项目标记的候选目录（默认扫描当前 workspace）
+overseer workspace pick              # 交互式选择并持久化
+overseer -w <path> <cmd>             # 本次运行临时切换工作目录
+```
+
 ### 11.1 自动检测
 
-`src/projects/scanner.ts` 扫描 `workspace.root`（默认 `..`，即 `E:\codeSpace`）的直接子目录。满足以下任一条件即视为项目：
+`src/projects/scanner.ts` 扫描 `resolveWorkspace()` 返回的根目录（默认 overSeer 自身当前目录）。scanner 会**先检查 workspace 根目录本身**是否是一个项目，再扫描其直接子目录。满足以下任一条件即视为项目：
 
 - 存在 `.git`
 - 存在 `package.json`
 - 存在 `AGENTS.md`
 - 存在 `.overseer.json`（manifest）
+
+> 默认配置下 overSeer 监理自己（root = `.`）。如需监理父目录下的多个兄弟项目，可把 `workspace.root` 改为 `..`，或运行 `overseer workspace set <父目录>` / `overseer -w <父目录> <cmd>`。
 
 ### 11.2 Project Manifest
 
@@ -450,20 +482,32 @@ overseer projects status <id>
 - Unix：`/tmp/overseer.sock`
 - 协议：每行一个 JSON，`{ id, op, payload? }` → `{ id, ok, data?, error? }`。
 
-当前 ops：
+当前 ops（共 21 个，`src/daemon/supervisor.ts:ipcHandler`）：
 
 | op | 说明 |
 |---|---|
-| `ping` | 心跳 |
+| `ping` | 心跳 + 时间戳 |
 | `status` | 完整状态（providers、mode、budget、taskLoop、vaultNotes） |
-| `chat` | 聊天 |
-| `kb.search` | 知识库检索 |
+| `chat` | 聊天（支持 `confirmTool` 二段式确认） |
+| `reset` | 清空 chat history |
+| `kb.search` | 知识库检索（链接图增强） |
+| `kb.related` | 指定笔记的相关笔记 |
 | `kb.recent` | 最近笔记 |
+| `logs.tail` | 读 `logs/overseer.log` 尾部（TUI 用） |
 | `taskloop.state` | TaskLoop 快照 |
 | `taskloop.pause` | 暂停任务循环 |
 | `taskloop.resume` | 恢复任务循环 |
-| `reset` | 清空 chat history |
-| `shutdown` | 关闭 daemon |
+| `cycle.run` | 触发一轮自主巡检 |
+| `queue.list` | 队列列表 |
+| `queue.show` | 队列单项详情 |
+| `queue.drop` | 丢弃队列项 |
+| `queue.execute` | 执行队列顶项（走 PdcaeLoop.executeQueueItem） |
+| `approvals.list` | 待审批列表 |
+| `approvals.decide` | 批准/拒绝（approved 时自动 fulfill） |
+| `supervise.plan` | 为项目生成意向 |
+| `supervise.develop` | 跑 develop 阶段 |
+| `health.check` | 探活所有 provider |
+| `shutdown` | 关闭 daemon（`setTimeout+exit` 避开 ipc.close 死锁） |
 
 ---
 
@@ -471,10 +515,20 @@ overseer projects status <id>
 
 ```bash
 overseer status                              # 状态面板
-overseer chat [message]                      # 聊天 / REPL
+overseer chat [message]                      # 聊天 / REPL，支持自然语言指令：
+                                             #   "查看状态"、"列出队列"、"暂停任务循环"、
+                                             #   "扫描一下 JHAVSP"、"审批通过 appr-xxx" 等
+                                             #   中/高风险操作会提示确认。
 overseer tui                                 # 全屏 dashboard
 
 overseer daemon <start|stop|restart|status>  # daemon 管理
+
+overseer workspace show                      # 查看当前工作目录及来源
+overseer workspace set <path>                # 持久化设置工作目录（daemon 共享）
+overseer workspace clear                     # 清除持久化，回退到 config.workspace.root
+overseer workspace list [dir]                # 列出候选项目目录
+overseer workspace pick                      # 交互式选择并持久化
+overseer -w <path> <cmd>                     # 本次运行临时指定工作目录（须在子命令前）
 
 overseer kb search <q>
 overseer kb show <relpath>
@@ -552,12 +606,33 @@ overseer health                              # provider 可达性探测
 4. **受保护路径**：manifest 默认保护 `config/`、`data/`、`logs/`、`vault/`、`dist/`、`node_modules/`、`package-lock.json`、`.secrets.*`、PID 文件等。
 5. **密钥管理**：API key 只从环境变量或 `.secrets.yaml` 读取，**永不写入主配置、不进 git**。
 6. **降级模式注意**：M5 起 degraded 模式不再在 mode 层禁止写/删/执行。fallback provider 的 `canAct=true`，实际副作用动作仍受 `ProjectManifest`、`protectedPaths`、自动 snapshot、approvals 约束。
+7. **chat 指令执行**：`overseer chat` 可识别自然语言并调用内部工具（`src/supervisor/chat-tools.ts`）。
+   - 只读/低风险工具（如 `status`、`queue.list`、`taskloop.pause`）直接执行。
+   - 中/高风险工具（如 `queue.clear`、`supervise.develop --execute`、`config.update`）默认需要用户输入 `"确认"`/`"yes"` 才会执行。
+   - 确认级别可通过 `daemon.chat.confirmLevel` 调整（`paranoid`/`normal`/`none`），`allowActions=false` 可完全禁止 chat 触发写操作。
+   - degraded/stopped 模式下只启用规则匹配，禁用需要复杂参数抽取的写操作。
 
 ---
 
 ## 20. 已知问题与实现不一致
 
 （当前无已知的实现不一致。HealthProbe 模型列表解析已统一。）
+
+### 已修复
+
+- **file.delete 审批闭环（已修复）**：早期版本中 codegen 产出 `delete` 时只创建 pending approval 但不执行后续删除,导致审批通过后文件依旧存在(审批变成装饰性阻塞)。已通过 `src/supervisor/fulfill.ts` + `ActionExecutor.deleteFile()` + 三个决策入口(CLI / chat-tools / IPC `approvals.decide`)接入 fulfillment,完成"未批准绝不删,批准后才执行"的真闭环。详见第 10.3 节。
+
+- **shell.exec 审批闭环（已修复）**：此前非白名单 `shell.exec` 会创建 pending approval，但 (a) approval context 未保存 `command`，(b) `fulfill.ts` 未实现 `shell.exec` 分支，导致用户批准后命令永远不会被执行。现已：`actions.ts` 创建 approval 时把 `command` 写入 context；`fulfill.ts` 增加 `shell.exec` 分支，批准后以 `bypassGate`（豁免 allowExec 白名单，因用户已显式批准该具体命令）调 `ActionExecutor.runShell`，仍保留自动 snapshot、protectedPaths 防御。
+
+- **outdated 扫描器跨平台（已修复）**：`src/scanners/outdated.ts` 原硬编码 `npm.cmd`（仅 Windows 可用）。改为按 `process.platform` 选择 `npm.cmd` / `npm`。
+
+- **VCS retention 违反 ESM 约定（已修复）**：`src/vcs/retention.ts` 的 `gitFor()` 曾用 `require('./git.js')` 规避循环依赖，违反 §17 "业务代码禁止 require()"。实际 `git.ts` 并不反向 import `retention.ts`，无循环依赖，改为正常静态 `import`。
+
+- **createLightweightTag 的 dead param（已修复）**：`src/vcs/git.ts` 中 `createLightweightTag(name, ref='HEAD')` 的 `ref` 参数被 `void ref` 丢弃，永远打在 HEAD。现 `ref === 'HEAD'` 走 `addTag`，其它 ref 走 `git tag <name> <ref>`，参数语义生效。
+
+- **lint 扫描器未启用（已修复）**：`src/scanners/index.ts` 中 `lint` 已注册但不在任何预设启用列表，永远不会被自动扫描调用。现加入 `FULL_ENABLED`（`full` 档启用）。
+
+- **IPC op 表文档落后（已修复）**：本节第 15 节原只列 10 个 op，实际 `ipcHandler` 实现 21 个。已同步。
 
 ---
 

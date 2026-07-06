@@ -148,6 +148,71 @@ export class ActionExecutor {
     }
   }
 
+  async deleteFile(relPath: string, opts: ExecOptions = {}): Promise<ActionResult> {
+    const action = 'file.delete';
+    const g = this.gate(action, opts);
+    if (!g.ok) {
+      const r = this.fail(action, g.reason!);
+      this.record(action, r, opts);
+      return r;
+    }
+
+    const manifest = readManifest(this.project.rootAbs);
+    if (!manifest.allowWrite && !opts.bypassGate) {
+      const r = this.fail(
+        action,
+        `project ${this.project.id} has allowWrite=false (set .overseer.json)`
+      );
+      this.record(action, r, opts);
+      return r;
+    }
+
+    const rel = path.isAbsolute(relPath)
+      ? path.relative(this.project.rootAbs, relPath)
+      : relPath;
+    const protectedHit = isProtected(rel.replace(/\\/g, '/'), manifest.protectedPaths);
+    if (protectedHit && !opts.bypassGate) {
+      const r = this.fail(
+        action,
+        `refuse to delete protected path "${rel}" (matches manifest.protectedPaths). Self-protection.`
+      );
+      this.record(action, r, opts);
+      return r;
+    }
+
+    const abs = path.isAbsolute(relPath) ? relPath : path.join(this.project.rootAbs, relPath);
+    if (!fs.existsSync(abs)) {
+      const r = this.fail(action, `file not found: ${rel}`);
+      this.record(action, r, opts);
+      return r;
+    }
+
+    let snap: Snapshot | undefined;
+    if (!opts.skipSnapshot) {
+      try {
+        // 用 noStash:true —— 默认 stash 会把待删的 untracked 文件一起 stash 走,
+        // 导致后续 unlinkSync 失败。gitCommit 也是同样处理。
+        snap = await this.snapshotter.take(`before ${action}: ${relPath}`, undefined, { noStash: true });
+      } catch (e) {
+        const r = this.fail(action, `snapshot failed: ${(e as Error).message}`);
+        this.record(action, r, opts);
+        return r;
+      }
+    }
+
+    try {
+      fs.unlinkSync(abs);
+      this.log.info({ project: this.project.id, relPath, snap: snap?.id }, 'file deleted');
+      const r: ActionResult = { ok: true, action, project: this.project.id, snapshot: snap };
+      this.record(action, r, opts);
+      return r;
+    } catch (e) {
+      const r = this.fail(action, (e as Error).message, snap);
+      this.record(action, r, opts);
+      return r;
+    }
+  }
+
   async runShell(command: string, opts: ExecOptions = {}): Promise<ActionResult & { stdout?: string; stderr?: string; code?: number }> {
     const action = 'shell.exec';
     const g = this.gate(action, opts);
@@ -164,7 +229,7 @@ export class ActionExecutor {
         project: this.project.id,
         action,
         description: command,
-        context: { manifestAllowExec: manifest.allowExec },
+        context: { command, manifestAllowExec: manifest.allowExec },
       });
       this.log.warn({ approvalId: appr.id, command }, 'shell.exec needs approval');
       const r = {

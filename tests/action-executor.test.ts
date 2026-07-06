@@ -102,4 +102,43 @@ describe('ActionExecutor', () => {
     expect(r.ok).toBe(false);
     expect(r.error?.toLowerCase()).toContain('stopped');
   });
+
+  it('deleteFile 删除文件并打 snapshot', async () => {
+    const target = path.join(dir, 'src', 'old.ts');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, 'export const OLD = 1;\n', 'utf8');
+    expect(fs.existsSync(target)).toBe(true);
+
+    const r = await executor.deleteFile('src/old.ts');
+    expect(r.ok).toBe(true);
+    expect(r.snapshot).toBeDefined();
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it('deleteFile 删除不存在的文件返回错误', async () => {
+    const r = await executor.deleteFile('src/never-existed.ts');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('not found');
+  });
+
+  it('deleteFile 拒绝删除受保护路径', async () => {
+    const target = path.join(dir, 'config', 'secrets.yaml');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, 'key: leak\n', 'utf8');
+    const r = await executor.deleteFile('config/secrets.yaml');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('protected');
+    expect(fs.existsSync(target)).toBe(true);
+  });
+
+  it('allowWrite=false 拒绝删除', async () => {
+    const target = path.join(dir, 'src', 'old.ts');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, 'x', 'utf8');
+    fs.writeFileSync(path.join(dir, '.overseer.json'), JSON.stringify({ allowWrite: false }), 'utf8');
+    const r = await executor.deleteFile('src/old.ts');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('allowWrite=false');
+    expect(fs.existsSync(target)).toBe(true);
+  });
 });

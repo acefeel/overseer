@@ -10,6 +10,7 @@ import { ProjectGit } from '../../vcs/git.js';
 import { Rollback } from '../../vcs/rollback.js';
 import { findProject } from '../../projects/scanner.js';
 import * as approvals from '../../supervisor/approvals.js';
+import { fulfill } from '../../supervisor/fulfill.js';
 
 export async function runSupervise(action: string, args: string[]): Promise<void> {
   switch (action) {
@@ -258,7 +259,7 @@ function listApprovals(): void {
   console.log();
 }
 
-function decideApproval(id: string, status: 'approved' | 'rejected'): void {
+async function decideApproval(id: string, status: 'approved' | 'rejected'): Promise<void> {
   if (!id) {
     console.log(chalk.red(`usage: overseer supervise ${status} <id>`));
     process.exit(2);
@@ -268,7 +269,18 @@ function decideApproval(id: string, status: 'approved' | 'rejected'): void {
     console.log(chalk.red(`not found: ${id}`));
     process.exit(1);
   }
-  console.log(chalk.green(`\n✓ ${a.id} → ${a.status}\n`));
+  console.log(chalk.green(`\n✓ ${a.id} → ${a.status}`));
+  if (a.status === 'approved') {
+    const res = await fulfill(a);
+    if (res.handled) {
+      if (res.ok) {
+        console.log(chalk.green(`  ↳ 已执行 ${res.action}`) + chalk.gray(` (snapshot ${res.snapshotId ?? '-'})`));
+      } else {
+        console.log(chalk.red(`  ↳ 执行失败: ${res.error}`));
+      }
+    }
+  }
+  console.log();
 }
 
 function severityColor(s: string): (t: string) => string {

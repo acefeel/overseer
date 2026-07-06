@@ -1,21 +1,30 @@
 import { PATHS } from './paths.js';
+import path from 'node:path';
 import fs from 'node:fs';
 import pino, { transport as pinoTransport } from 'pino';
 import { parse as parseYaml } from 'yaml';
 
 type Level = 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
-let cached: { level: Level; pretty: boolean } | null = null;
+interface LoggingCfg {
+  level: Level;
+  pretty: boolean;
+  /** 日志文件绝对路径（JSON 行）；daemon 后台运行时的主要可观测来源 */
+  file: string;
+}
 
-function readLoggingConfig(): { level: Level; pretty: boolean } {
+let cached: LoggingCfg | null = null;
+
+function readLoggingConfig(): LoggingCfg {
   if (cached) return cached;
-  const fallback: { level: Level; pretty: boolean } = { level: 'info', pretty: true };
+  const fallback: LoggingCfg = { level: 'info', pretty: true, file: PATHS.LOG_FILE };
   try {
     const raw = fs.readFileSync(PATHS.MAIN_CONFIG, 'utf8');
-    const doc = parseYaml(raw) as { logging?: { level?: Level; pretty?: boolean } };
+    const doc = parseYaml(raw) as { logging?: { level?: Level; pretty?: boolean; file?: string } };
     cached = {
       level: doc?.logging?.level ?? fallback.level,
       pretty: doc?.logging?.pretty ?? fallback.pretty,
+      file: doc?.logging?.file ? path.resolve(PATHS.ROOT, doc.logging.file) : fallback.file,
     };
     return cached;
   } catch {
@@ -49,23 +58,36 @@ function wrap(base: pino.Logger): Logger {
 
 export function getLogger(name = 'overseer'): Logger {
   if (_logger) return _logger.child({ name });
-  const { level, pretty } = readLoggingConfig();
-  const transport = pretty
-    ? pinoTransport({
-        target: 'pino-pretty',
-        options: {
-          colorize: true,
-          translateTime: 'SYS:HH:MM:ss.l',
-          ignore: 'pid,hostname',
-          destination: 1,
-        },
-      })
-    : undefined;
-  const base = pino({
-    level,
-    base: undefined,
-    timestamp: pino.stdTimeFunctions.isoTime,
-  }, transport as any);
+  const { level, pretty, file } = readLoggingConfig();
+  // 双 destination：
+  //   - stdout：前台运行时看得到（pretty 彩色 或 纯 JSON）
+  //   - 文件：JSON 行，daemon 后台运行（launcher 用 stdio:'ignore'）时的主要可观测来源，
+  //           也供 TUI 的 logs.tail / Live Log 面板读取
+  const targets: any[] = [];
+  if (pretty) {
+    targets.push({
+      target: 'pino-pretty',
+      level,
+      options: {
+        colorize: true,
+        translateTime: 'SYS:HH:MM:ss.l',
+        ignore: 'pid,hostname',
+        destination: 1,
+      },
+    });
+  } else {
+    targets.push({ target: 'pino/file', level, options: { destination: 1 } });
+  }
+  targets.push({ target: 'pino/file', level, options: { destination: file, mkdir: true } });
+  const transport = pinoTransport({ targets });
+  const base = pino(
+    {
+      level,
+      base: undefined,
+      timestamp: pino.stdTimeFunctions.isoTime,
+    },
+    transport as any
+  );
   _logger = wrap(base);
   return _logger.child({ name });
 }

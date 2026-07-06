@@ -4,6 +4,16 @@ import { loadConfig } from '../../util/config.js';
 import { Supervisor } from '../../daemon/supervisor.js';
 import { IpcClient } from '../../daemon/ipc.js';
 
+interface ChatResponse {
+  reply: string;
+  model: string;
+  provider: string;
+  retrievedNotes?: number;
+  memoryWritten?: { type: string; rel: string } | null;
+  needsConfirmation?: boolean;
+  pendingTool?: { tool: string; args: Record<string, unknown>; summary: string };
+}
+
 export async function runChat(initial?: string): Promise<void> {
   const cfg = loadConfig();
   const mainReady = !!cfg.providers[cfg.router.chain[0]]?.apiKey;
@@ -29,25 +39,24 @@ export async function runChat(initial?: string): Promise<void> {
     ? chalk.magenta(' [degraded: 仅本地 fallback 可用]')
     : '';
   console.log(chalk.bold.cyan(`\n=== overSeer chat ===${modeTag}`));
-  console.log(chalk.gray('输入消息回车发送，"exit" 或 Ctrl+C 退出。\n'));
+  console.log(chalk.gray('输入消息回车发送，"exit" 或 Ctrl+C 退出。'));
+  console.log(chalk.gray('支持自然语言指令，例如："查看状态"、"暂停任务循环"、"列出队列"。\n'));
 
   const ipc = new IpcClient(cfg.daemon.ipcName);
   const daemonAlive = await ipc.isAlive().catch(() => false);
   const localSup = daemonAlive ? null : new Supervisor();
 
-  const sendOnce = async (text: string): Promise<void> => {
+  const sendOnce = async (text: string, confirmTool?: ChatResponse['pendingTool']): Promise<ChatResponse> => {
     try {
-      let res: {
-        reply: string;
-        model: string;
-        provider: string;
-        retrievedNotes?: number;
-        memoryWritten?: { type: string; rel: string } | null;
-      };
+      const payload: { text: string; confirmTool?: ChatResponse['pendingTool'] } = { text };
+      if (confirmTool) payload.confirmTool = confirmTool;
+      let res: ChatResponse;
       if (daemonAlive) {
-        res = await ipc.request('chat', { text });
+        res = await ipc.request('chat', payload);
       } else {
-        res = await localSup!.chat(text);
+        const opts: { confirmTool?: ChatResponse['pendingTool'] } = {};
+        if (confirmTool) opts.confirmTool = confirmTool;
+        res = await localSup!.chat(text, opts as any);
       }
       const parts: string[] = [];
       if (res.provider !== '-') {
@@ -61,13 +70,19 @@ export async function runChat(initial?: string): Promise<void> {
       }
       const usageLine = parts.length ? '  ' + parts.join(' ') : '';
       console.log(chalk.green('\noverSeer:') + ' ' + res.reply + usageLine + '\n');
+      return res;
     } catch (e) {
       console.log(chalk.red(`\n错误: ${(e as Error).message}\n`));
+      return { reply: '', model: '-', provider: '-', needsConfirmation: false };
     }
   };
 
   if (initial) {
-    await sendOnce(initial);
+    const res = await sendOnce(initial);
+    if (res.needsConfirmation && res.pendingTool) {
+      const ok = await askConfirm(res.pendingTool.summary);
+      if (ok) await sendOnce('确认', res.pendingTool);
+    }
     return;
   }
 
@@ -83,6 +98,17 @@ export async function runChat(initial?: string): Promise<void> {
       console.log(chalk.gray('bye.'));
       break;
     }
-    await sendOnce(text);
+    const res = await sendOnce(text);
+    if (res.needsConfirmation && res.pendingTool) {
+      const ok = await askConfirm(res.pendingTool.summary);
+      if (ok) await sendOnce('确认', res.pendingTool);
+    }
   }
+}
+
+async function askConfirm(summary: string): Promise<boolean> {
+  console.log(chalk.yellow(`⚠ 待确认操作：${summary}`));
+  const answer = await input({ message: chalk.blue('确认执行? (yes/no):'), default: '' });
+  const t = answer.trim().toLowerCase();
+  return t === 'yes' || t === 'y' || t === '确认';
 }

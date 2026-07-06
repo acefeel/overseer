@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { PATHS, ensureDataDirs } from '../util/paths.js';
+import { resolveWorkspace } from '../util/workspace.js';
 import { pipePath } from './ipc.js';
 import { getLogger } from '../util/logger.js';
 
@@ -70,6 +71,9 @@ export async function launchDaemon(
   }
 
   // 3. spawn detached
+  // 把当前生效的 workspace 通过 env 注入子进程，确保 daemon 与 CLI 使用同一工作目录
+  // （尤其 --workspace 一次性参数场景：daemon 读不到 CLI 的 session 覆盖）
+  const childEnv = { ...process.env, OVERSEER_WORKSPACE: resolveWorkspace() };
   let child;
   try {
     child = spawn(cmd, args, {
@@ -77,7 +81,7 @@ export async function launchDaemon(
       stdio: 'ignore',
       shell: false,
       cwd: PATHS.ROOT,
-      env: process.env,
+      env: childEnv,
     });
     child.unref();
     trace(`spawned pid=${child.pid} cmd=${cmd} entry=${args[args.length - 1]}`);

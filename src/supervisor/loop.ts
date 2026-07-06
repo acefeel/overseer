@@ -298,12 +298,13 @@ export class PdcaeLoop {
     const writtenRels: string[] = [];
     for (const c of codegenRes.changes) {
       if (c.action === 'delete') {
-        // delete 走 approvals（高危）
+        // delete 走 approvals（高危）。approval 通过后由 supervisor/fulfill.ts 执行真正的删除。
+        // context 里必须带上 path / intentionId,以便 fulfill 能恢复删除上下文。
         const appr = approvals.create({
           project: project.id,
           action: 'file.delete',
           description: `delete ${c.path} (intention ${intent.id})`,
-          context: { rationale: c.rationale },
+          context: { rationale: c.rationale, path: c.path, intentionId: intent.id },
         });
         applied.push({
           path: c.path,

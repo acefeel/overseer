@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { getLogger } from '../util/logger.js';
 import { PATHS } from '../util/paths.js';
 import { listSnapshots, deleteSnapshot } from './snapshot.js';
+import { ProjectGit } from './git.js';
 
 export interface RetentionResult {
   ledgerTrimmed: number;
@@ -100,10 +101,8 @@ export class DataRetention {
     return { snapshotsRemoved: toRemove.length, tagsRemoved };
   }
 
-  private gitFor(projectRoot: string): any {
+  private gitFor(projectRoot: string): ProjectGit | null {
     try {
-      // 懒加载避免循环依赖
-      const { ProjectGit } = require('./git.js');
       return new ProjectGit(projectRoot);
     } catch {
       return null;

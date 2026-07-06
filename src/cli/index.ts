@@ -9,13 +9,52 @@ import { runSupervise } from './commands/supervise.js';
 import { runQueue, runCycle, runHealth } from './commands/autonomy.js';
 import { runDoctor } from './commands/doctor.js';
 import { runTui } from './commands/tui.js';
+import { runWorkspace } from './commands/workspace.js';
+import {
+  setSessionWorkspace,
+  skipWorkspacePrompt,
+  promptWorkspaceIfUnset,
+} from '../util/workspace.js';
+import { getLogger } from '../util/logger.js';
 
 const program = new Command();
 
 program
   .name('overseer')
   .description('overSeer —— 有预算意识的开发监理 agent')
-  .version('0.1.0');
+  .version('0.1.0')
+  .option(
+    '-w, --workspace <path>',
+    '指定本次运行的工作目录（覆盖配置与持久化值）。注意：需放在子命令之前，如 `overseer -w ../proj status`；或用环境变量 OVERSEER_WORKSPACE'
+  );
+
+// preAction：处理 --workspace 注入，并在未显式设置时交互提示选择工作目录。
+// 仅对带 action 的子命令触发；workspace 自身 / help 跳过提示，避免递归与打扰。
+program.hook('preAction', async (_thisCmd, actionCmd) => {
+  const opts = program.opts();
+  const actionName = actionCmd.name();
+
+  // workspace 子命令自身不参与启动提示
+  if (actionName === 'workspace') {
+    skipWorkspacePrompt();
+  }
+
+  if (typeof opts.workspace === 'string' && opts.workspace.length > 0) {
+    setSessionWorkspace(opts.workspace);
+    skipWorkspacePrompt();
+    return;
+  }
+
+  if (actionName === 'workspace' || actionName === 'help') {
+    return;
+  }
+
+  try {
+    await promptWorkspaceIfUnset();
+  } catch (e) {
+    getLogger('workspace').warn({ err: String(e) }, 'workspace prompt failed');
+  }
+});
 
 program
   .command('status')
@@ -66,6 +105,12 @@ program
   .description('自主巡检：run | log [--limit N] | scan <project> [--aggressiveness L|N|F] [--allow-shell]')
   .allowUnknownOption(true)
   .action((action: string, args: string[]) => runCycle(action, args));
+
+program
+  .command('workspace <action> [args...]')
+  .description('工作目录：show | set <path> | clear | list [dir] | pick')
+  .allowUnknownOption(true)
+  .action((action: string, args: string[]) => runWorkspace(action, args));
 
 program
   .command('health')

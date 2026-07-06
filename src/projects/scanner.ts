@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getLogger } from '../util/logger.js';
-import { loadConfig } from '../util/config.js';
-import { resolveWorkspaceRoot, PATHS } from '../util/paths.js';
+import { resolveWorkspace } from '../util/workspace.js';
+import { PATHS } from '../util/paths.js';
 
 export interface ProjectInfo {
   id: string;
@@ -26,11 +26,6 @@ const IGNORE = new Set([
   'logs',
   '.obsidian',
 ]);
-
-function resolveWorkspace(): string {
-  const cfg = loadConfig();
-  return resolveWorkspaceRoot(cfg.workspace.root);
-}
 
 function projectNameFromRoot(rootAbs: string): string {
   return path.basename(rootAbs);
@@ -65,12 +60,17 @@ export function scanProjects(): ProjectInfo[] {
   const out: ProjectInfo[] = [];
 
   if (fs.existsSync(ws)) {
+    // 先检查 workspace 根目录本身是否是一个项目。
+    // 这样配置 workspace.root = '.' 时，overSeer 自身会被识别为被监理项目。
+    const self = isProjectRoot(ws);
+    if (self) out.push(self);
+
     let top: fs.Dirent[];
     try {
       top = fs.readdirSync(ws, { withFileTypes: true });
     } catch (e) {
       log.warn({ err: String(e), ws }, 'cannot read workspace');
-      return [];
+      return out;
     }
     for (const e of top) {
       if (!e.isDirectory()) continue;

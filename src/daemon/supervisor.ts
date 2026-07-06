@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { getTracker } from '../budget/tracker.js';
 import { BudgetPolicy } from '../budget/policy.js';
 import { loadConfig } from '../util/config.js';
@@ -25,8 +26,15 @@ import type { TaskLoop } from './taskloop.js';
 import { Autonomy, type Aggressiveness } from '../supervisor/autonomy.js';
 import * as queue from '../supervisor/queue.js';
 import * as approvals from '../supervisor/approvals.js';
+import { fulfill } from '../supervisor/fulfill.js';
 import { PdcaeLoop } from '../supervisor/loop.js';
 import { HealthProbe } from '../providers/health.js';
+import {
+  ChatToolRouter,
+  type ChatToolContext,
+} from '../supervisor/chat-tools.js';
+import { scanProject } from '../scanners/index.js';
+import { scanProjects, findProject } from '../projects/scanner.js';
 
 export interface ChatTurn {
   role: 'user' | 'assistant';
@@ -48,6 +56,14 @@ export interface ChatResult {
   memoryWritten?: { type: string; rel: string } | null;
   mode: SupervisionMode;
   degraded?: boolean;
+  /** 是否需要用户确认后才能执行 */
+  needsConfirmation?: boolean;
+  /** 待确认的工具调用信息，需要用户确认时由 CLI 保存并传回 */
+  pendingTool?: {
+    tool: string;
+    args: Record<string, unknown>;
+    summary: string;
+  };
 }
 
 const SYSTEM_BASE_NORMAL =
@@ -78,6 +94,7 @@ export class Supervisor {
   private history: ChatTurn[] = [];
   private currentMode: SupervisionMode = 'normal';
   private taskLoop?: TaskLoop;
+  private chatToolRouter: ChatToolRouter;
 
   constructor() {
     const cfg = loadConfig();
@@ -92,6 +109,10 @@ export class Supervisor {
     this.searcher = new VaultSearcher(this.retriever);
     this.judge = new MemoryJudge(this.router);
     this.modePolicy = new ModePolicy();
+    this.chatToolRouter = new ChatToolRouter(this.router, {
+      confirmLevel: (cfg.daemon.chat?.confirmLevel as any) ?? 'normal',
+      allowActions: cfg.daemon.chat?.allowActions ?? true,
+    });
     this.recomputeMode();
   }
 
@@ -157,6 +178,75 @@ export class Supervisor {
     const { decision } = this.recomputeMode();
     const mode = decision.mode;
 
+    // 1. 用户确认之前的待执行工具
+    const confirmTool = (opts as any).confirmTool as
+      | { tool: string; args: Record<string, unknown>; summary: string }
+      | undefined;
+    if (confirmTool) {
+      const ctx = this.buildChatToolContext();
+      const execResult = await this.chatToolRouter.execute(ctx, confirmTool.tool, confirmTool.args);
+      const summary = await this.chatToolRouter.summarize(text, execResult);
+      return this.finalizeToolReply(text, summary, mode);
+    }
+
+    // 2. 识别用户意图
+    const routing = await this.chatToolRouter.recognize(text, mode);
+    if (routing.tool === 'chat') {
+      return this.chatNormally(text, opts, mode, decision, routing.reply);
+    }
+
+    // 3. 需要确认的高/中风险操作
+    if (routing.needsConfirm) {
+      return {
+        reply: `我准备执行：${routing.summary}\n\n请输入 "确认" 或 "yes" 继续。`,
+        model: '-',
+        provider: '-',
+        retrievedNotes: 0,
+        memoryWritten: null,
+        mode,
+        needsConfirmation: true,
+        pendingTool: { tool: routing.tool, args: routing.args, summary: routing.summary },
+      };
+    }
+
+    // 4. 直接执行工具，并用 LLM 总结结果
+    const ctx = this.buildChatToolContext();
+    const execResult = await this.chatToolRouter.execute(ctx, routing.tool, routing.args);
+    const summary = await this.chatToolRouter.summarize(text, execResult);
+    return this.finalizeToolReply(text, summary, mode);
+  }
+
+  private async finalizeToolReply(userText: string, assistantText: string, mode: SupervisionMode): Promise<ChatResult> {
+    this.history.push({ role: 'user', content: userText });
+    this.history.push({ role: 'assistant', content: assistantText });
+    if (this.history.length > 40) {
+      this.history = this.history.slice(-40);
+    }
+    const chatResult: ChatResult = {
+      reply: assistantText,
+      model: '-',
+      provider: '-',
+      retrievedNotes: 0,
+      memoryWritten: null,
+      mode,
+    };
+    this.recordChatLog(
+      [
+        { role: 'user', content: userText },
+        { role: 'assistant', content: assistantText },
+      ],
+      chatResult
+    ).catch((e: Error) => this.log.warn({ err: String(e) }, 'recordChatLog failed'));
+    return chatResult;
+  }
+
+  private async chatNormally(
+    text: string,
+    opts: ChatOptions,
+    mode: SupervisionMode,
+    decision: ModeDecision,
+    directReply?: string
+  ): Promise<ChatResult> {
     if (mode === 'stopped') {
       const snap = this.budget.snapshot();
       const mainReady = this.router.mainChainReady();
@@ -182,6 +272,12 @@ export class Supervisor {
 
     const degraded = mode === 'degraded';
     const mainReady = this.router.mainChainReady();
+
+    // 如果规则匹配已经给出了直接回复（降级模式），直接返回
+    if (directReply) {
+      const banner = degraded ? DEGRADED_BANNER + degradedReasonLine(decision.trigger as any) : '';
+      return this.finalizeToolReply(text, banner + directReply, mode);
+    }
 
     let retrieved = 0;
     let contextBlock = '';
@@ -398,6 +494,77 @@ export class Supervisor {
     });
   }
 
+  private buildChatToolContext(): ChatToolContext {
+    return {
+      status: () => this.status(),
+      mode: () => this.currentMode,
+      budgetCanRunTask: (estimated: number) => this.budget.canRunTask(estimated),
+      modeCanPerform: (action: ActionType) => this.modePolicy.canPerform(action, this.currentMode),
+      pauseTaskLoop: async () => this.taskLoop?.stop() ?? Promise.resolve(),
+      resumeTaskLoop: () => this.taskLoop?.resume(),
+      runCycle: (opts) => this.getAutonomy().runCycle(opts),
+      scanProject: async (projectId, opts) => {
+        const project = findProject(projectId);
+        if (!project) throw new Error(`project not found: ${projectId}`);
+        const enabled =
+          opts.aggressiveness === 'light'
+            ? ['git', 'todo'] as const
+            : opts.aggressiveness === 'full'
+            ? ['git', 'todo', 'outdated', 'test', 'lint'] as const
+            : ['git', 'todo', 'outdated', 'lint'] as const;
+        const allowShell = opts.allowShellDuringScan ?? false;
+        const actual = allowShell ? enabled : enabled.filter((s) => s === 'git' || s === 'todo');
+        return scanProject(project, {
+          enabledScanners: actual as any,
+          allowShell,
+          limitPerScanner: 5,
+        });
+      },
+      listQueue: (opts) => queue.list(opts),
+      showQueue: (id) => queue.getById(id),
+      dropQueue: (id) => queue.drop(id),
+      clearQueue: (project) => queue.clear(project),
+      queueStats: () => queue.stats(),
+      listApprovals: (pendingOnly) => (pendingOnly ? approvals.listPending() : approvals.listAll()),
+      decideApproval: async (id, status) => {
+        const a = approvals.decide(id, status);
+        if (a && a.status === 'approved') {
+          try {
+            const r = await fulfill(a);
+            if (r.handled && !r.ok) {
+              this.log.warn({ id: a.id, action: a.action, err: r.error }, 'approval fulfillment failed');
+            }
+          } catch (e) {
+            this.log.warn({ id: a.id, err: (e as Error).message }, 'approval fulfillment threw');
+          }
+        }
+        return a;
+      },
+      planProject: (projectId, hint) => this.getPdcae().plan(projectId, hint),
+      developIntention: (id, execute) => (execute ? this.getPdcae().develop(id, false) : this.getPdcae().executeIntention(id)),
+      searchKb: (q, limit) => this.searcher.search({ q, limit: limit ?? 5 }, { linkBoost: 2, relatedDepth: 0 }),
+      recentKb: (limit, type) => this.retriever.recent(limit ?? 10, type),
+      listProjects: () => scanProjects(),
+      showProject: (id) => findProject(id),
+      updateAutonomyConfig: (updates) => {
+        const localPath = PATHS.LOCAL_CONFIG;
+        let existing: Record<string, unknown> = {};
+        if (fs.existsSync(localPath)) {
+          try {
+            existing = parseYaml(fs.readFileSync(localPath, 'utf8')) as Record<string, unknown> ?? {};
+          } catch {
+            existing = {};
+          }
+        }
+        const daemon = (existing.daemon as Record<string, unknown>) ?? {};
+        const autonomy = (daemon.autonomy as Record<string, unknown>) ?? {};
+        const merged = { ...autonomy, ...updates };
+        existing.daemon = { ...daemon, autonomy: merged };
+        fs.writeFileSync(localPath, stringifyYaml(existing), 'utf8');
+      },
+    };
+  }
+
   reset(): void {
     this.history = [];
   }
@@ -411,9 +578,13 @@ export class Supervisor {
           this.recomputeMode();
           return this.status();
         case 'chat': {
-          const p = (req.payload as { text?: string; opts?: ChatOptions }) ?? {};
+          const p = (req.payload as { text?: string; opts?: ChatOptions; confirmTool?: { tool: string; args: Record<string, unknown>; summary: string } }) ?? {};
           if (!p.text) throw new Error("missing 'text' in chat payload");
-          return this.chat(p.text, p.opts);
+          const opts: ChatOptions = { ...(p.opts ?? {}) };
+          if (p.confirmTool) {
+            (opts as any).confirmTool = p.confirmTool;
+          }
+          return this.chat(p.text, opts);
         }
         case 'kb.search': {
           const q = (req.payload as Record<string, unknown>) ?? {};
@@ -438,6 +609,42 @@ export class Supervisor {
         case 'kb.recent': {
           const p = (req.payload as { limit?: number; type?: NoteType }) ?? {};
           return this.retriever.recent(p.limit ?? 10, p.type);
+        }
+        case 'logs.tail': {
+          const p = (req.payload as { limit?: number }) ?? {};
+          const limit = Math.min(Math.max(p.limit ?? 100, 1), 500);
+          const logFile = PATHS.LOG_FILE;
+          try {
+            if (!fs.existsSync(logFile)) {
+              return { lines: [], file: logFile, exists: false };
+            }
+            const stat = fs.statSync(logFile);
+            const TAIL_BYTES = 256 * 1024;
+            let content: string;
+            if (stat.size > TAIL_BYTES) {
+              const fd = fs.openSync(logFile, 'r');
+              try {
+                const buf = Buffer.alloc(TAIL_BYTES);
+                fs.readSync(fd, buf, 0, TAIL_BYTES, stat.size - TAIL_BYTES);
+                content = buf.toString('utf8');
+              } finally {
+                fs.closeSync(fd);
+              }
+              const firstNl = content.indexOf('\n');
+              if (firstNl >= 0) content = content.slice(firstNl + 1);
+            } else {
+              content = fs.readFileSync(logFile, 'utf8');
+            }
+            const all = content.split(/\r?\n/).filter((l) => l.trim().length > 0);
+            return {
+              lines: all.slice(-limit),
+              file: logFile,
+              size: stat.size,
+              mtime: stat.mtime.toISOString(),
+            };
+          } catch (e) {
+            return { lines: [], error: (e as Error).message };
+          }
         }
         case 'reset':
           this.reset();
@@ -498,6 +705,16 @@ export class Supervisor {
           if (!id || !status) throw new Error("missing 'id' or 'status' in approvals.decide payload");
           const result = approvals.decide(id, status, 'tui');
           if (!result) throw new Error(`approval not found: ${id}`);
+          if (result.status === 'approved') {
+            try {
+              const r = await fulfill(result);
+              if (r.handled && !r.ok) {
+                this.log.warn({ id: result.id, action: result.action, err: r.error }, 'approval fulfillment failed');
+              }
+            } catch (e) {
+              this.log.warn({ id: result.id, err: (e as Error).message }, 'approval fulfillment threw');
+            }
+          }
           return result;
         }
         case 'supervise.plan': {

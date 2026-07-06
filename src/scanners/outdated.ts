@@ -78,7 +78,9 @@ export class OutdatedScanner implements Scanner {
 
   private async runNpmOutdated(rootAbs: string): Promise<Map<string, OutdatedPackage>> {
     return new Promise((resolve) => {
-      const child = spawn('npm.cmd', ['outdated', '--json'], {
+      // Windows 上 PATH 里是 npm.cmd；其它平台是 npm。spawn(shell:false) 需精确名。
+      const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+      const child = spawn(npmBin, ['outdated', '--json'], {
         cwd: rootAbs,
         shell: false,
         stdio: ['ignore', 'pipe', 'ignore'],

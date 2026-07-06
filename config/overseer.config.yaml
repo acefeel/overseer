@@ -10,9 +10,14 @@
 # 工作区与路径
 # ----------------------------------------------------------------------------
 workspace:
-  # 监理根目录（默认为 overSeer 父目录，即整个 codeSpace）
-  root: ..
+  # 监理根目录（默认为 overSeer 自身当前目录，即只监理 overSeer 自己）
+  # 若要监理父目录下多个兄弟项目，可改为 '..'
+  # 优先级：--workspace 参数 > 环境变量 OVERSEER_WORKSPACE
+  #         > `overseer workspace set` 持久化值 > 此处 root 配置
+  root: .
   # 哪些子目录算作被监理的项目（相对 workspace.root）。空数组 = 自动扫描
+  # 注意：当 workspace 根目录本身就是一个项目（含 .git/package.json/AGENTS.md/.overseer.json
+  # 之一）时，scanner 会把根目录本身作为被监理项目，不再依赖子目录。
   watchProjects: []
   # 哪些目录前缀忽略（不扫描、不改）
   ignore:
@@ -22,6 +27,9 @@ workspace:
     - vault
     - data
     - logs
+  # 当 workspace 未被显式设置（仍为默认值）时，CLI 启动是否交互提示用户选择工作目录。
+  # 默认 true。设为 false 可关闭提示；用户在提示中选择"不再提示"也会自动写入 local 覆盖为 false。
+  promptIfUnset: true
 
 # ----------------------------------------------------------------------------
 # Vault (Obsidian 知识库)
